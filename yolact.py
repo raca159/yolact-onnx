@@ -8,6 +8,11 @@ from math import sqrt
 from typing import List
 from collections import defaultdict
 
+
+import pyximport
+pyximport.install(setup_args={"include_dirs":np.get_include()}, reload_support=True)
+from utils.cython_nms import nms as cnms
+
 from data.config import cfg, mask_type
 from layers import Detect
 from layers.interpolate import InterpolateModule
@@ -16,6 +21,8 @@ from backbone import construct_backbone
 import torch.backends.cudnn as cudnn
 from utils import timer
 from utils.functions import MovingAverage, make_net
+
+from layers.box_utils import decode, jaccard
 
 # This is required for Pytorch 1.0.1 on Windows to initialize Cuda on some driver versions.
 # See the bug report here: https://github.com/pytorch/pytorch/issues/17108
@@ -28,8 +35,6 @@ if not use_jit:
 
 ScriptModuleWrapper = torch.jit.ScriptModule if use_jit else nn.Module
 script_method_wrapper = torch.jit.script_method if use_jit else lambda fn, _rcn=None: fn
-
-
 
 class Concat(nn.Module):
     def __init__(self, nets, extra_params):
@@ -395,7 +400,6 @@ class Yolact(nn.Module):
             return maskiou_p
 
 
-
     def __init__(self):
         super().__init__()
 
@@ -469,6 +473,184 @@ class Yolact(nn.Module):
         # For use in evaluation
         self.detect = Detect(cfg.num_classes, bkg_label=0, top_k=cfg.nms_top_k,
             conf_thresh=cfg.nms_conf_thresh, nms_thresh=cfg.nms_thresh)
+
+    
+    def cc_fast_nms(self, boxes, masks, scores, iou_threshold:float=0.5, top_k:int=200):
+        # Collapse all the classes into 1 
+        scores, classes = scores.max(dim=0)
+
+        _, idx = scores.sort(0, descending=True)
+        idx = idx[:top_k]
+
+        boxes_idx = boxes[idx]
+
+        # Compute the pairwise IoU between the boxes
+        iou = jaccard(boxes_idx, boxes_idx)
+        
+        # Zero out the lower triangle of the cosine similarity matrix and diagonal
+        iou.triu_(diagonal=1)
+
+        # Now that everything in the diagonal and below is zeroed out, if we take the max
+        # of the IoU matrix along the columns, each column will represent the maximum IoU
+        # between this element and every element with a higher score than this element.
+        iou_max, _ = torch.max(iou, dim=0)
+
+        # Now just filter out the ones greater than the threshold, i.e., only keep boxes that
+        # don't have a higher scoring box that would supress it in normal NMS.
+        idx_out = idx[iou_max <= iou_threshold]
+        
+        return boxes[idx_out], masks[idx_out], classes[idx_out], scores[idx_out]
+
+    def fast_nms(self, boxes, masks, scores, iou_threshold:float=0.5, top_k:int=200, second_threshold:bool=False, self_conf_thresh=0):
+        scores, idx = scores.sort(1, descending=True)
+
+        idx = idx[:, :top_k].contiguous()
+        scores = scores[:, :top_k]
+
+        num_classes, num_dets = idx.size()
+
+        boxes = boxes[idx.view(-1), :].view(num_classes, num_dets, 4)
+        masks = masks[idx.view(-1), :].view(num_classes, num_dets, -1)
+
+        iou = jaccard(boxes, boxes)
+        iou.triu_(diagonal=1)
+        iou_max, _ = iou.max(dim=1)
+
+        # Now just filter out the ones higher than the threshold
+        keep = (iou_max <= iou_threshold)
+
+        # We should also only keep detections over the confidence threshold, but at the cost of
+        # maxing out your detection count for every image, you can just not do that. Because we
+        # have such a minimal amount of computation per detection (matrix mulitplication only),
+        # this increase doesn't affect us much (+0.2 mAP for 34 -> 33 fps), so we leave it out.
+        # However, when you implement this in your method, you should do this second threshold.
+        if second_threshold:
+            keep *= (scores > self_conf_thresh)
+
+        # Assign each kept detection to its corresponding class
+        classes = torch.arange(num_classes, device=boxes.device)[:, None].expand_as(keep)
+        classes = classes[keep]
+
+        boxes = boxes[keep]
+        masks = masks[keep]
+        scores = scores[keep]
+        
+        # Only keep the top cfg.max_num_detections highest scores across all classes
+        scores, idx = scores.sort(0, descending=True)
+        idx = idx[:cfg.max_num_detections]
+        scores = scores[:cfg.max_num_detections]
+
+        classes = classes[idx]
+        boxes = boxes[idx]
+        masks = masks[idx]
+
+        return boxes, masks, classes, scores
+
+    def traditional_nms(self, boxes, masks, scores, iou_threshold=0.5, conf_thresh=0.05):
+
+        num_classes = scores.size(0)
+
+        idx_lst = []
+        cls_lst = []
+        scr_lst = []
+
+        # Multiplying by max_size is necessary because of how cnms computes its area and intersections
+        boxes = boxes * cfg.max_size
+
+        for _cls in range(num_classes):
+            cls_scores = scores[_cls, :]
+            conf_mask = cls_scores > conf_thresh
+            idx = torch.arange(cls_scores.size(0), device=boxes.device)
+
+            cls_scores = cls_scores[conf_mask]
+            idx = idx[conf_mask]
+
+            if cls_scores.size(0) == 0:
+                continue
+            
+            preds = torch.cat([boxes[conf_mask], cls_scores[:, None]], dim=1).cpu().numpy()
+            keep = cnms(preds, iou_threshold)
+            keep = torch.Tensor(keep, device=boxes.device).long()
+
+            idx_lst.append(idx[keep])
+            cls_lst.append(keep * 0 + _cls)
+            scr_lst.append(cls_scores[keep])
+        
+        idx     = torch.cat(idx_lst, dim=0)
+        classes = torch.cat(cls_lst, dim=0)
+        scores  = torch.cat(scr_lst, dim=0)
+
+        scores, idx2 = scores.sort(0, descending=True)
+        idx2 = idx2[:cfg.max_num_detections]
+        scores = scores[:cfg.max_num_detections]
+
+        idx = idx[idx2]
+        classes = classes[idx2]
+
+        # Undo the multiplication above
+        return boxes[idx] / cfg.max_size, masks[idx], classes, scores
+
+    def detect_df(self, batch_idx, conf_preds, decoded_boxes, mask_data, self_conf_thresh, self_use_fast_nms, self_use_cross_class_nms, self_nms_thresh, self_top_k):
+        """ Perform nms for only the max scoring class that isn't background (class 0) """
+        cur_scores = conf_preds[batch_idx, 1:, :]
+        conf_scores, _ = torch.max(cur_scores, dim=0)
+
+        keep = (conf_scores > self_conf_thresh)
+        scores = cur_scores[:, keep]
+        boxes = decoded_boxes[keep, :]
+        masks = mask_data[batch_idx, keep, :]
+
+        if scores.size(1) == 0:
+            return None
+        
+        if self_use_fast_nms:
+            if self_use_cross_class_nms:
+                boxes, masks, classes, scores = self.cc_fast_nms(boxes, masks, scores, self_nms_thresh, self_top_k)
+            else:
+                boxes, masks, classes, scores = self.fast_nms(boxes, masks, scores, self_nms_thresh, self_top_k, self_conf_thresh)
+        else:
+            boxes, masks, classes, scores = self.traditional_nms(boxes, masks, scores, self_nms_thresh, self_conf_thresh)
+
+            if self_use_cross_class_nms:
+                print('Warning: Cross Class Traditional NMS is not implemented.')
+
+        return {'box': boxes, 'mask': masks, 'class': classes, 'score': scores}
+
+    def detect(self, pred_outs):
+
+        self_num_classes = cfg.num_classes
+        self_top_k = cfg.nms_top_k
+        self_nms_thresh = cfg.nms_thresh
+        self_conf_thresh = cfg.nms_conf_thresh
+        self_background_label = 0
+        self_use_cross_class_nms = False
+        self_use_fast_nms = False
+
+        loc_data   = pred_outs['loc']
+        conf_data  = pred_outs['conf']
+        mask_data  = pred_outs['mask']
+        prior_data = pred_outs['priors']
+        proto_data = pred_outs['proto'] if 'proto' in pred_outs else None
+        inst_data  = pred_outs['inst']  if 'inst'  in pred_outs else None
+        out = {'box': [], 'mask': [], 'class': [], 'score': []}
+
+        batch_size = loc_data.size(0)
+        num_priors = prior_data.size(0)
+
+        conf_preds = conf_data.view(batch_size, num_priors, self_num_classes).transpose(2, 1).contiguous()
+
+        for batch_idx in range(batch_size):
+            decoded_boxes = decode(loc_data[batch_idx], prior_data)
+            result = self.detect_df(batch_idx, conf_preds, decoded_boxes, mask_data, inst_data, self_conf_thresh, self_use_fast_nms, self_use_cross_class_nms, self_nms_thresh, self_top_k)
+
+            if result is not None and proto_data is not None:
+                result['proto'] = proto_data[batch_idx]
+            
+            out['box'].append(result['box'])
+            out['mask'].append(result['mask'])
+            out['class'].append(result['class'])
+            out['score'].append(result['score'])
+        return out
 
     def save_weights(self, path):
         """ Saves the model's weights using compression because the file sizes were getting too big. """
@@ -672,41 +854,18 @@ class Yolact(nn.Module):
                     
                 else:
                     pred_outs['conf'] = F.softmax(pred_outs['conf'], -1)
+            
+            # if detect works
+            detect_out =  self.detect(pred_outs) # remove if bad
+            pred_outs['box'] = detect_out['box'] # remove if bad
+            pred_outs['mask'] = detect_out['mask'] # remove if bad
+            pred_outs['class'] = detect_out['class'] # remove if bad
+            pred_outs['score'] = detect_out['score'] # remove if bad
+            toreturn = pred_outs['box'], pred_outs['class'], pred_outs['score'], pred_outs['loc'], pred_outs['conf'], pred_outs['mask'], pred_outs['priors'], pred_outs['proto']
 
-            # return self.detect(pred_outs, self)
-            return pred_outs['loc'], pred_outs['conf'], pred_outs['mask'], pred_outs['priors'], pred_outs['proto']
-
-# def detect(self, batch_idx, conf_preds, decoded_boxes, mask_data, inst_data):
-#     """ Perform nms for only the max scoring class that isn't background (class 0) """
-#     cur_scores = conf_preds[batch_idx, 1:, :]
-#     conf_scores, _ = torch.max(cur_scores, dim=0)
-
-#     keep = (conf_scores > self.conf_thresh)
-#     scores = cur_scores[:, keep]
-#     boxes = decoded_boxes[keep, :]
-#     masks = mask_data[batch_idx, keep, :]
-
-#     if inst_data is not None:
-#         inst = inst_data[batch_idx, keep, :]
-
-#     if scores.size(1) == 0:
-#         return None
-    
-#     if self.use_fast_nms:
-#         if self.use_cross_class_nms:
-#             boxes, masks, classes, scores = self.cc_fast_nms(boxes, masks, scores, self.nms_thresh, self.top_k)
-#         else:
-#             boxes, masks, classes, scores = self.fast_nms(boxes, masks, scores, self.nms_thresh, self.top_k)
-#     else:
-#         boxes, masks, classes, scores = self.traditional_nms(boxes, masks, scores, self.nms_thresh, self.conf_thresh)
-
-#         if self.use_cross_class_nms:
-#             print('Warning: Cross Class Traditional NMS is not implemented.')
-
-#     return {'box': boxes, 'mask': masks, 'class': classes, 'score': scores}
-
-
-
+            # # if detect don't works
+            # toreturn = pred_outs['loc'], pred_outs['conf'], pred_outs['mask'], pred_outs['priors'], pred_outs['proto']
+            return toreturn
 
 # Some testing code
 if __name__ == '__main__':

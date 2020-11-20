@@ -1,66 +1,15 @@
 from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
-import torch
-import torch.nn as nn
+
 import pickle
-
 from collections import OrderedDict
-
-# try:
-#     from dcn_v2 import DCN
-# except ImportError:
-#     def DCN(*args, **kwdargs):
-#         raise Exception('DCN could not be imported. If you want to use YOLACT++ models, compile DCN. Check the README for instructions.')
-
-
 import math
 import torch
 from torch import nn
-from torch.autograd import Function
 from torch.nn.modules.utils import _pair
-from torch.autograd.function import once_differentiable
 
 import _ext as _backend
-
-
-class _DCNv2(Function):
-    @staticmethod
-    def forward(ctx, input, offset, mask, weight, bias,
-                stride, padding, dilation, deformable_groups):
-        ctx.stride = _pair(stride)
-        ctx.padding = _pair(padding)
-        ctx.dilation = _pair(dilation)
-        ctx.kernel_size = _pair(weight.shape[2:4])
-        ctx.deformable_groups = deformable_groups
-        output = _backend.dcn_v2_forward(input, weight, bias,
-                                         offset, mask,
-                                         ctx.kernel_size[0], ctx.kernel_size[1],
-                                         ctx.stride[0], ctx.stride[1],
-                                         ctx.padding[0], ctx.padding[1],
-                                         ctx.dilation[0], ctx.dilation[1],
-                                         ctx.deformable_groups)
-        ctx.save_for_backward(input, offset, mask, weight, bias)
-        return output
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_output):
-        input, offset, mask, weight, bias = ctx.saved_tensors
-        grad_input, grad_offset, grad_mask, grad_weight, grad_bias = \
-            _backend.dcn_v2_backward(input, weight,
-                                     bias,
-                                     offset, mask,
-                                     grad_output,
-                                     ctx.kernel_size[0], ctx.kernel_size[1],
-                                     ctx.stride[0], ctx.stride[1],
-                                     ctx.padding[0], ctx.padding[1],
-                                     ctx.dilation[0], ctx.dilation[1],
-                                     ctx.deformable_groups)
-
-        return grad_input, grad_offset, grad_mask, grad_weight, grad_bias,\
-            None, None, None, None,
-
 
 # dcn_v2_conv = _DCNv2.apply
 def dcn_v2_conv(input, offset, mask, weight, bias,
@@ -77,7 +26,6 @@ def dcn_v2_conv(input, offset, mask, weight, bias,
                                          ctx_padding[0], ctx_padding[1],
                                          ctx_dilation[0], ctx_dilation[1],
                                          ctx_deformable_groups)
-
 
 class DCNv2(nn.Module):
 
@@ -117,7 +65,6 @@ class DCNv2(nn.Module):
                            self.padding,
                            self.dilation,
                            self.deformable_groups)
-
 
 class DCN(DCNv2):
 
@@ -197,7 +144,6 @@ class Bottleneck(nn.Module):
         out = self.relu(out)
 
         return out
-
 
 class ResNetBackbone(nn.Module):
     """ Adapted from torchvision.models.resnet """
@@ -299,9 +245,6 @@ class ResNetBackbone(nn.Module):
         """ Add a downsample layer to the backbone as per what SSD does. """
         self._make_layer(block, conv_channels // block.expansion, blocks=depth, stride=downsample)
 
-
-
-
 class ResNetBackboneGN(ResNetBackbone):
 
     def __init__(self, layers, num_groups=32):
@@ -356,11 +299,6 @@ class ResNetBackboneGN(ResNetBackbone):
         self.load_state_dict(new_state_dict, strict=False)
 
 
-
-
-
-
-
 def darknetconvlayer(in_channels, out_channels, *args, **kwdargs):
     """
     Implements a conv, activation, then batch norm.
@@ -387,9 +325,6 @@ class DarkNetBlock(nn.Module):
 
     def forward(self, x):
         return self.conv2(self.conv1(x)) + x
-
-
-
 
 class DarkNetBackbone(nn.Module):
     """
@@ -458,10 +393,6 @@ class DarkNetBackbone(nn.Module):
         """ Initializes the backbone weights for training. """
         # Note: Using strict=False is berry scary. Triple check this.
         self.load_state_dict(torch.load(path), strict=False)
-
-
-
-
 
 class VGGBackbone(nn.Module):
     """
@@ -585,8 +516,6 @@ class VGGBackbone(nn.Module):
         self.channels.append(self.in_channels)
         self.layers.append(layer)
         
-                
-
 
 def construct_backbone(cfg):
     """ Constructs a backbone given a backbone config object (see config.py). """

@@ -342,8 +342,6 @@ class Detections:
             json.dump(output, f)
         
 
-        
-
 def mask_iou(mask1, mask2, iscrowd=False):
     """
     Inputs inputs are matricies of size _ x N. Output is size _1 x _2.
@@ -807,7 +805,6 @@ def savevideo(net:Yolact, in_path:str, out_path:str):
     out.release()
     print()
 
-
 def evaluate(net:Yolact, dataset, train_mode=False):
     net.detect.use_fast_nms = args.fast_nms
     cfg.mask_proto_debug = args.mask_proto_debug
@@ -942,7 +939,6 @@ def evaluate(net:Yolact, dataset, train_mode=False):
     except KeyboardInterrupt:
         print('Stopping...')
 
-
 def calc_map(ap_data):
     print('Calculating mAP...')
     aps = [{'box': [], 'mask': []} for _ in iou_thresholds]
@@ -980,8 +976,6 @@ def print_maps(all_maps):
         print(make_row([iou_type] + ['%.2f' % x for x in all_maps[iou_type].values()]))
     print(make_sep(len(all_maps['box']) + 1))
     print()
-
-
 
 if __name__ == '__main__':
     parse_args()
