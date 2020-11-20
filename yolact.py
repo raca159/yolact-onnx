@@ -616,7 +616,7 @@ class Yolact(nn.Module):
 
         return {'box': boxes, 'mask': masks, 'class': classes, 'score': scores}
 
-    def detect(self, pred_outs):
+    def detect4inference(self, pred_outs):
 
         self_num_classes = cfg.num_classes
         self_top_k = cfg.nms_top_k
@@ -641,7 +641,7 @@ class Yolact(nn.Module):
 
         for batch_idx in range(batch_size):
             decoded_boxes = decode(loc_data[batch_idx], prior_data)
-            result = self.detect_df(batch_idx, conf_preds, decoded_boxes, mask_data, inst_data, self_conf_thresh, self_use_fast_nms, self_use_cross_class_nms, self_nms_thresh, self_top_k)
+            result = self.detect_df(batch_idx, conf_preds, decoded_boxes, mask_data, self_conf_thresh, self_use_fast_nms, self_use_cross_class_nms, self_nms_thresh, self_top_k)
 
             if result is not None and proto_data is not None:
                 result['proto'] = proto_data[batch_idx]
@@ -856,13 +856,14 @@ class Yolact(nn.Module):
                     pred_outs['conf'] = F.softmax(pred_outs['conf'], -1)
             
             # if detect works
-            detect_out =  self.detect(pred_outs) # remove if bad
-            pred_outs['box'] = detect_out['box'] # remove if bad
-            pred_outs['mask'] = detect_out['mask'] # remove if bad
-            pred_outs['class'] = detect_out['class'] # remove if bad
-            pred_outs['score'] = detect_out['score'] # remove if bad
-            toreturn = pred_outs['box'], pred_outs['class'], pred_outs['score'], pred_outs['loc'], pred_outs['conf'], pred_outs['mask'], pred_outs['priors'], pred_outs['proto']
-
+            detect_out =  self.detect4inference(pred_outs) # remove if bad
+            # if detect works
+            detect_out =  self.detect4inference(pred_outs) # remove if bad
+            pred_outs['box'] = torch.cat(detect_out['box'], dim=0) # remove if bad
+            pred_outs['mask'] = torch.cat(detect_out['mask'], dim=0) # remove if bad
+            pred_outs['class'] = torch.cat(detect_out['class'], dim=0) # remove if bad
+            pred_outs['score'] = torch.cat(detect_out['score'], dim=0) # remove if bad
+            toreturn = torch.tensor(pred_outs['box'].tolist()), pred_outs['class'], pred_outs['score'], pred_outs['loc'], pred_outs['conf'], pred_outs['mask'], pred_outs['priors'], pred_outs['proto']
             # # if detect don't works
             # toreturn = pred_outs['loc'], pred_outs['conf'], pred_outs['mask'], pred_outs['priors'], pred_outs['proto']
             return toreturn
